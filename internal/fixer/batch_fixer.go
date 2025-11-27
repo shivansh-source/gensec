@@ -36,7 +36,7 @@ func (bf *BatchFixer) FixFileVulnerabilities(file string, vulns []flagging.Flag,
 	fmt.Printf("   File: %s\n", file)
 	fmt.Printf("   Vulns to fix: %d\n", len(vulns))
 
-	// Take top 5 vulns (already sorted by severity)
+	// Take top N vulns (already sorted by severity)
 	batch := vulns
 	if len(batch) > config.MaxVulnsPerBatch {
 		batch = batch[:config.MaxVulnsPerBatch]
@@ -60,6 +60,7 @@ func (bf *BatchFixer) FixFileVulnerabilities(file string, vulns []flagging.Flag,
 		return result
 	}
 
+	fixedCode = strings.TrimSpace(fixedCode)
 	if fixedCode == "" {
 		fmt.Printf("   ❌ Empty fix generated\n")
 		result.Status = "failed"
@@ -67,33 +68,53 @@ func (bf *BatchFixer) FixFileVulnerabilities(file string, vulns []flagging.Flag,
 		return result
 	}
 
-	// Save fixed code temporarily
-	tempFile := file + ".fixed"
-	if err := os.WriteFile(tempFile, []byte(fixedCode), 0644); err != nil {
-		fmt.Printf("   ❌ Failed to save temp file: %v\n", err)
+	if fixedCode == fileContent {
+		fmt.Printf("   ⚠️  LLM returned unchanged code\n")
+		for _, v := range batch {
+			bf.tracker.RecordAttempt(v.VulnID, "failed", "LLM returned unchanged code")
+			result.VulnsFailed = append(result.VulnsFailed, v)
+		}
+		result.Status = "failed"
+		return result
+	}
+
+	// --- Apply fix to disk with rollback safety ---
+
+	originalCode := fileContent
+	backupFile := file + ".gensec.bak"
+
+	// Save backup of original
+	if err := os.WriteFile(backupFile, []byte(originalCode), 0644); err != nil {
+		fmt.Printf("   ⚠️  Failed to write backup file: %v (continuing)\n", err)
+	}
+
+	// Write fixed code to real file
+	if err := os.WriteFile(file, []byte(fixedCode), 0644); err != nil {
+		fmt.Printf("   ❌ Failed to write fixed file: %v\n", err)
 		result.Status = "failed"
 		result.VulnsFailed = batch
 		return result
 	}
-	defer os.Remove(tempFile)
+	fmt.Printf("   💾 Wrote candidate fixed file: %s\n", file)
 
-	// Verify: Re-scan the fixed file
+	// Verify: Re-scan repository with scanners
 	fmt.Printf("\n   Verifying fixes...\n")
-	fileContentMap := map[string]string{file: fixedCode}
-	verificationResults, err := bf.verifyFixes(fileContentMap)
+	verificationResults, err := bf.verifyFixes()
 	if err != nil {
 		fmt.Printf("   ⚠️  Verification error: %v\n", err)
+		// On verification error, restore original code
+		_ = os.WriteFile(file, []byte(originalCode), 0644)
 		result.Status = "partial"
-		result.FixedCode = fixedCode
+		result.FixedCode = ""
 		result.VulnsFailed = batch
 		return result
 	}
 
-	// Classify results
+	// Classify each vuln as fixed / failed / escalated
 	for _, vuln := range batch {
 		stillPresent := false
 		for _, verifiedVuln := range verificationResults {
-			if verifiedVuln.VulnID == vuln.VulnID {
+			if verifiedVuln.VulnID == vuln.VulnID && verifiedVuln.File == file {
 				stillPresent = true
 				break
 			}
@@ -105,81 +126,106 @@ func (bf *BatchFixer) FixFileVulnerabilities(file string, vulns []flagging.Flag,
 			bf.tracker.RecordAttempt(vuln.VulnID, "fixed", "")
 			fmt.Printf("   ✅ Fixed: %s\n", vuln.VulnID)
 		} else {
-			// Still present, record attempt
+			// Still present → record as failed and maybe escalate
 			bf.tracker.RecordAttempt(vuln.VulnID, "failed", "Still detected after LLM fix")
-
 			attempts := bf.tracker.GetAttempts(vuln.VulnID)
+
 			if attempts >= config.MaxAttemptsPerVuln {
-				// Escalate
 				result.VulnsEscalated = append(result.VulnsEscalated, vuln)
 				bf.tracker.MarkEscalated(vuln.VulnID)
 				fmt.Printf("   🚩 Escalated: %s (attempt %d/%d)\n", vuln.VulnID, attempts, config.MaxAttemptsPerVuln)
 			} else {
-				// Retry next time
 				result.VulnsFailed = append(result.VulnsFailed, vuln)
 				fmt.Printf("   ⚠️  Failed: %s (attempt %d/%d)\n", vuln.VulnID, attempts, config.MaxAttemptsPerVuln)
 			}
 		}
 	}
 
-	// Determine overall status
-	if len(result.VulnsFailed) == 0 && len(result.VulnsEscalated) == 0 {
-		result.Status = "success"
-	} else if len(result.VulnsFixed) > 0 {
-		result.Status = "partial"
-	} else {
+	// If nothing actually fixed → roll back file
+	if len(result.VulnsFixed) == 0 {
+		fmt.Printf("   ↩️  No vulnerabilities fixed, restoring original file\n")
+		_ = os.WriteFile(file, []byte(originalCode), 0644)
 		result.Status = "failed"
+		result.FixedCode = ""
+	} else {
+		// Keep fixed version on disk
+		result.FixedCode = fixedCode
+
+		if len(result.VulnsFailed) == 0 && len(result.VulnsEscalated) == 0 {
+			result.Status = "success"
+		} else {
+			result.Status = "partial"
+		}
 	}
 
-	result.FixedCode = fixedCode
-	result.PRDescription = bf.buildPRDescription(result)
+	// Cleanup backup (optional, you can keep it if you want)
+	_ = os.Remove(backupFile)
 
+	result.PRDescription = bf.buildPRDescription(result)
 	return result
 }
 
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
 func (bf *BatchFixer) buildBatchDescription(vulns []flagging.Flag) string {
-	desc := ""
+	var b strings.Builder
 	for _, v := range vulns {
-		desc += fmt.Sprintf("- Line %d: %s (%s) - %s\n", v.Line, v.VulnID, v.CWE, v.Message)
+		fmt.Fprintf(&b, "- Line %d: %s (%s, %s)\n  %s\n\n",
+			v.Line, v.VulnID, v.CWE, v.Severity, v.Message)
 	}
-	return desc
+	return b.String()
 }
 
+// ✅ FULL PROMPT DEFINED HERE
 func (bf *BatchFixer) generateFixes(originalCode, batchDesc string) (string, error) {
-	prompt := fmt.Sprintf(`You are a Go security expert. Fix the following vulnerabilities in this Go code.
+	prompt := fmt.Sprintf(`You are a Go security refactoring engine.
 
-ORIGINAL CODE:
-%s
+Your job:
+- Take the ORIGINAL CODE and the list of VULNERABILITIES TO FIX.
+- Apply ONLY minimal, targeted changes needed to remove those vulnerabilities.
+- Preserve behavior and public APIs.
+- Use idiomatic, production-grade Go.
+
+Important security rules:
+- For SQL issues: NEVER build SQL with string concatenation. Use parameterized queries (e.g. db.Query("SELECT ... WHERE name = ?", value)).
+- For HTTP/TLS issues: Prefer http.ListenAndServeTLS with proper cert/key arguments instead of http.ListenAndServe.
+- For command execution: avoid passing unsanitized user input to shells; prefer parametrized exec or safe whitelisting.
 
 VULNERABILITIES TO FIX:
 %s
 
-INSTRUCTIONS:
-1. Fix each vulnerability securely
-2. Maintain the original code structure
-3. Add minimal changes
-4. Return ONLY the complete fixed code (no explanations)
+ORIGINAL CODE:
+%s
+
+STRICT OUTPUT RULES:
+- Return ONLY the complete, fixed Go source file.
+- Do NOT wrap the code in markdown fences.
+- Do NOT add explanations or comments about what you did.
+- The file must compile as-is.
 
 FIXED CODE:
-`, originalCode, batchDesc)
+`, batchDesc, originalCode)
 
-	// Call LLM via groq
 	triager := llm.NewLLMTriager()
 	response, err := triager.CallGroqDirect(prompt)
 	if err != nil {
 		return "", err
 	}
 
-	// Extract code from response (it might have markdown fences)
+	response = strings.TrimSpace(response)
+
+	// Extract code from markdown fences if present
 	if strings.Contains(response, "```") {
 		start := strings.Index(response, "```go")
 		if start == -1 {
 			start = strings.Index(response, "```")
 		}
 		if start != -1 {
-			start += 3
+			start += 3 // skip ```
 			if strings.HasPrefix(response[start:], "go") {
-				start += 2
+				start += 2 // skip "go"
 			}
 			end := strings.LastIndex(response, "```")
 			if end > start {
@@ -188,65 +234,18 @@ FIXED CODE:
 		}
 	}
 
-	// If no fences, assume entire response is code
-	return strings.TrimSpace(response), nil
+	// Otherwise assume the whole response is just code
+	return response, nil
 }
 
-func (bf *BatchFixer) verifyFixes(fileContent map[string]string) ([]flagging.Flag, error) {
-	// Re-scan with multi-scanner
+// verifyFixes re-runs the scanners against the current workspace on disk.
+func (bf *BatchFixer) verifyFixes() ([]flagging.Flag, error) {
 	findings, err := bf.scanner.ScanAll()
 	if err != nil {
 		return nil, err
 	}
 
-	// Note: In a real implementation, we would need to run the data flow analysis again here
-	// on the findings to confirm they are still valid flags.
-	// For now, we'll assume raw scanner findings are enough to verify "still present".
-	// But ideally, we should re-run the full pipeline.
-
-	// Since ScanAll runs on disk, and we haven't written the file to disk permanently yet (only temp),
-	// this verification step is tricky without writing to disk.
-	// The current implementation writes to a temp file but ScanAll scans the current directory ".".
-	// We might need to swap the file content temporarily or point scanner to the temp file.
-	// However, ScanAll scans "." recursively.
-
-	// For this specific implementation request, I will assume the user understands this limitation
-	// or that we should just return the findings as is.
-	// Wait, the user code says:
-	// tempFile := file + ".fixed"
-	// ...
-	// fileContentMap := map[string]string{file: fixedCode}
-	// verificationResults, err := bf.verifyFixes(fileContentMap)
-
-	// But ScanAll() scans the current directory.
-	// We need to handle this. The user's provided code for verifyFixes just calls ScanAll().
-	// This implies we should probably overwrite the file temporarily or something.
-	// But the user's code in FixFileVulnerabilities writes to `tempFile`.
-
-	// Let's look at the user's provided `verifyFixes` again:
-	// func (bf *BatchFixer) verifyFixes(fileContent map[string]string) ([]flagging.Flag, error) {
-	// 	// Re-scan with multi-scanner
-	// 	findings, err := bf.scanner.ScanAll()
-	// ...
-
-	// This won't work as expected if `ScanAll` scans the original file.
-	// However, I must implement what the user requested.
-	// I will implement it exactly as requested, but I'll add a comment or small fix if obvious.
-	// Actually, `ScanAll` runs semgrep/gitleaks on ".".
-	// If we want to verify the fix, we should probably have swapped the file content.
-	// But I will stick to the user's code for now to avoid deviating too much,
-	// unless I see a `WriteFile` in `verifyFixes` in the user prompt? No.
-
-	// Wait, `FixFileVulnerabilities` writes `tempFile`.
-	// If `ScanAll` picks up `.fixed` files, then it might work.
-	// But usually scanners ignore non-go files or specific extensions.
-	// Let's just implement it.
-
-	// To make it compile, I need to convert []scanner.Finding to []flagging.Flag
-	// The return type is []flagging.Flag but ScanAll returns []scanner.Finding.
-	// I need to convert it.
-
-	flagFindings := []flagging.Flag{}
+	flagFindings := make([]flagging.Flag, 0, len(findings))
 	for _, f := range findings {
 		flagFindings = append(flagFindings, flagging.Flag{
 			VulnID:   f.VulnID,
@@ -262,7 +261,8 @@ func (bf *BatchFixer) verifyFixes(fileContent map[string]string) ([]flagging.Fla
 }
 
 func (bf *BatchFixer) buildPRDescription(result *FixResult) string {
-	desc := fmt.Sprintf("## GenSec: Fix %d vulnerabilities in `%s`\n\n", len(result.VulnsFixed), result.File)
+	desc := fmt.Sprintf("## GenSec: Fix %d vulnerabilities in `%s`\n\n",
+		len(result.VulnsFixed), result.File)
 
 	if len(result.VulnsFixed) > 0 {
 		desc += "### ✅ Fixed Vulnerabilities\n"
@@ -291,7 +291,10 @@ func (bf *BatchFixer) buildPRDescription(result *FixResult) string {
 		desc += "### 🚩 Escalated to Human Review\n"
 		for _, v := range result.VulnsEscalated {
 			attempts := bf.tracker.GetAttempts(v.VulnID)
-			desc += fmt.Sprintf("- **%s** (%s): Max attempts (%d/%d) reached\n", v.VulnID, v.CWE, attempts, config.MaxAttemptsPerVuln)
+			desc += fmt.Sprintf(
+				"- **%s** (%s): Max attempts (%d/%d) reached\n",
+				v.VulnID, v.CWE, attempts, config.MaxAttemptsPerVuln,
+			)
 		}
 		desc += "\n"
 	}

@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,7 +16,7 @@ import (
 )
 
 func main() {
-	godotenv.Load()
+	_ = godotenv.Load()
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -50,8 +49,15 @@ func cmdScan() {
 		return
 	}
 
+	// Decide scan root: default ".", or use arg if provided
+	scanRoot := "."
+	if len(os.Args) >= 3 && os.Args[2] != "" {
+		scanRoot = os.Args[2]
+	}
+	fmt.Printf("📂 Scan root: %s\n", scanRoot)
+
 	// Load file content
-	fileContent := loadFileContent()
+	fileContent := loadFileContent(scanRoot)
 	if len(fileContent) == 0 {
 		fmt.Println("⚠️  No .go files found")
 		return
@@ -84,7 +90,7 @@ func cmdScan() {
 	triager := llm.NewLLMTriager()
 	triaged, err := triager.TriageFlags(flags)
 	if err != nil {
-		fmt.Printf("⚠️  LLM triage failed: %v (using unfilitered flags)\n", err)
+		fmt.Printf("⚠️  LLM triage failed: %v (using unfiltered flags)\n", err)
 		triaged = flags
 	}
 
@@ -96,7 +102,7 @@ func cmdScan() {
 	fmt.Printf("After data-flow flagging: %d\n", len(flags))
 	fmt.Printf("After LLM triage (confidence >= 60%%): %d\n", len(triaged))
 	fmt.Printf("\nResults saved to:\n")
-	fmt.Printf("  - report_flagged.json (all flags)\n")
+	fmt.Printf("  - %s (all flags)\n", config.ReportFileFlagged)
 	fmt.Printf("\n✅ Ready for PHASE 4: Batch Fix & Verify\n")
 }
 
@@ -105,7 +111,7 @@ func cmdFix() {
 	fmt.Println("=" + strings.Repeat("=", 59))
 
 	// Load flagged findings from previous scan
-	data, err := ioutil.ReadFile(config.ReportFileFlagged)
+	data, err := os.ReadFile(config.ReportFileFlagged)
 	if err != nil {
 		fmt.Println("❌ No flagged findings found. Run 'scan' first.")
 		return
@@ -122,10 +128,7 @@ func cmdFix() {
 		return
 	}
 
-	// Load file content
-	fileContent := loadFileContent()
-
-	// Group by file
+	// Group flags by file
 	flagsByFile := make(map[string][]flagging.Flag)
 	for _, flag := range flags {
 		flagsByFile[flag.File] = append(flagsByFile[flag.File], flag)
@@ -138,7 +141,7 @@ func cmdFix() {
 	fmt.Println("PHASE 4: BATCH FIX & VERIFICATION (LOOP)")
 	fmt.Println(strings.Repeat("=", 60))
 
-	fixer := fixer.NewBatchFixer()
+	batchFixer := fixer.NewBatchFixer()
 	prCount := 0
 	resultsCreated := []struct {
 		file      string
@@ -153,22 +156,31 @@ func cmdFix() {
 			break
 		}
 
-		content, ok := fileContent[file]
-		if !ok {
-			fmt.Printf("⚠️  File not loaded: %s\n", file)
-			continue
+		// Resolve a concrete path and read current file content from disk
+		path := filepath.ToSlash(filepath.Clean(file))
+		if !filepath.IsAbs(path) {
+			// relative to current working dir (inside container: /scan)
+			path = filepath.Clean(path)
 		}
 
-		result := fixer.FixFileVulnerabilities(file, fileFlags, content)
+		src, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Printf("⚠️  Failed to read file %s: %v\n", path, err)
+			continue
+		}
+		content := string(src)
+
+		// Call batch fixer on this file
+		result := batchFixer.FixFileVulnerabilities(path, fileFlags, content)
 
 		if result.Status != "failed" && result.FixedCode != "" {
-			// Save fixed code
-			if err := ioutil.WriteFile(file, []byte(result.FixedCode), 0644); err != nil {
+			// Save fixed code back to the same file (in /scan → host project)
+			if err := os.WriteFile(path, []byte(result.FixedCode), 0644); err != nil {
 				fmt.Printf("❌ Failed to save fixed file: %v\n", err)
 				continue
 			}
 
-			fmt.Printf("\n✅ Fixed file saved: %s\n", file)
+			fmt.Printf("\n✅ Fixed file saved: %s\n", path)
 			prCount++
 
 			resultsCreated = append(resultsCreated, struct {
@@ -206,25 +218,29 @@ func cmdStatus() {
 	fmt.Printf("GitHub User: %s\n", config.GitHubUser)
 
 	if _, err := os.Stat(config.ReportFileFlagged); err == nil {
-		data, _ := ioutil.ReadFile(config.ReportFileFlagged)
+		data, _ := os.ReadFile(config.ReportFileFlagged)
 		var flags []flagging.Flag
-		json.Unmarshal(data, &flags)
+		_ = json.Unmarshal(data, &flags)
 		fmt.Printf("Flagged findings: %d\n", len(flags))
 	}
 }
 
-func loadFileContent() map[string]string {
+func loadFileContent(root string) map[string]string {
 	content := make(map[string]string)
 
-	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+	cwd, _ := os.Getwd()
+	fmt.Printf("🔍 Walking files from root=%s (cwd=%s)\n", root, cwd)
+
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
 		// Skip directories
 		if info.IsDir() {
-			// Skip vendor, node_modules, .git, etc.
-			if strings.HasPrefix(info.Name(), ".") || info.Name() == "vendor" || info.Name() == "node_modules" {
+			if strings.HasPrefix(info.Name(), ".") ||
+				info.Name() == "vendor" ||
+				info.Name() == "node_modules" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -232,10 +248,28 @@ func loadFileContent() map[string]string {
 
 		// Load .go files
 		if strings.HasSuffix(path, ".go") {
-			data, err := ioutil.ReadFile(path)
-			if err == nil {
-				content[path] = string(data)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil
 			}
+
+			// Normalize keys so we can match scanner output formats
+			abs := filepath.Clean(path)
+
+			rel, errRel := filepath.Rel(root, path)
+			if errRel != nil {
+				rel = filepath.Base(path)
+			}
+			rel = filepath.ToSlash(rel)
+
+			base := filepath.Base(path)
+
+			// Store all lookup forms
+			content[rel] = string(data)  // ex: vulnerable.go or src/vulnerable.go
+			content[base] = string(data) // vulnerable.go
+			content[abs] = string(data)  // /scan/vulnerable.go
+
+			return nil
 		}
 
 		return nil
@@ -253,19 +287,19 @@ func printUsage() {
 🤖 GenSec Pro v3 - Autonomous Vulnerability Fixer with Data Flow Flagging
 
 Usage:
-  go run cmd/gensec/main.go scan              # Scan, flag, and triage vulns
-  go run cmd/gensec/main.go fix               # Batch fix vulnerabilities
-  go run cmd/gensec/main.go status            # Show scan status
+  gensec scan [path]                       # Scan, flag, and triage vulns
+  gensec fix                               # Batch fix vulnerabilities
+  gensec status                            # Show scan status
 
 Environment Variables:
-  GROQ_API_KEY                                # Groq API key (required)
-  GITHUB_TOKEN                                # GitHub PAT
-  GITHUB_USER                                 # GitHub username
-  USER_PLAN                                   # "free", "pro", "enterprise"
+  GROQ_API_KEY                             # Groq API key (required)
+  GITHUB_TOKEN                             # GitHub PAT
+  GITHUB_USER                              # GitHub username
+  USER_PLAN                                # "free", "pro", "enterprise"
 
 Example:
   export GROQ_API_KEY=gsk_...
   export USER_PLAN=pro
-  go run cmd/gensec/main.go scan
+  gensec scan .
 `)
 }

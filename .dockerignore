@@ -1,0 +1,9 @@
+﻿.git
+.gitignore
+.env
+*.log
+report_*.json
+attempt_log.json
+vendor
+node_modules
+.DS_Store
