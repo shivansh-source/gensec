@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -35,7 +36,9 @@ func (m *MultiScanner) ScanAll() ([]Finding, error) {
 	}{
 		{"Semgrep", m.runSemgrep},
 		{"Gitleaks", m.runGitleaks},
+		{"Gitleaks", m.runGitleaks},
 		{"Trivy", m.runTrivy},
+		{"GenSecPatterns", m.runGenSecPatterns},
 	}
 
 	for _, scanner := range scanners {
@@ -234,6 +237,159 @@ func (m *MultiScanner) runTrivy() ([]Finding, error) {
 	}
 
 	fmt.Printf("  ✅ Trivy: %d findings\n", len(findings))
+	return findings, nil
+}
+
+func (m *MultiScanner) runGenSecPatterns() ([]Finding, error) {
+	findings := []Finding{}
+
+	// Walk all .go files in the current directory
+	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip on error, don't kill the whole scan
+		}
+		if info.IsDir() {
+			// skip vendor, node_modules, .git, etc.
+			base := info.Name()
+			if strings.HasPrefix(base, ".") || base == "vendor" || base == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		content := string(data)
+		lines := strings.Split(content, "\n")
+
+		for i, line := range lines {
+			lineNo := i + 1
+			trim := strings.TrimSpace(line)
+
+			// --- CWE-78: Command Injection (exec.Command with shell) ---
+			if strings.Contains(trim, `exec.Command("sh", "-c"`) ||
+				strings.Contains(trim, `exec.Command("bash", "-c"`) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.command-injection.exec-command",
+					CWE:      "CWE-78",
+					Message:  "Possible OS command injection via exec.Command with shell (\"sh\"/\"bash\" and \"-c\").",
+					Severity: config.SeverityHIGH,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-22: Path Traversal / Insecure file read ---
+			if strings.Contains(trim, `os.ReadFile("/var/www/files/`) ||
+				strings.Contains(trim, `os.ReadFile("/uploads/`) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.path-traversal.file-read",
+					CWE:      "CWE-22",
+					Message:  "User-controlled file path used in os.ReadFile without sanitization; possible path traversal.",
+					Severity: config.SeverityHIGH,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-434: Unrestricted File Upload ---
+			if strings.Contains(trim, `r.FormFile("file"`) ||
+				strings.Contains(trim, `r.FormFile("picture"`) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.file-upload.unrestricted",
+					CWE:      "CWE-434",
+					Message:  "Possible unrestricted file upload via r.FormFile without content-type or extension validation.",
+					Severity: config.SeverityHIGH,
+					Snippet:  trim,
+				})
+			}
+			if strings.Contains(trim, `os.WriteFile("/uploads/`) ||
+				strings.Contains(trim, `os.WriteFile("/public/uploads/`) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.file-upload.write-unsafe-path",
+					CWE:      "CWE-434",
+					Message:  "File written to uploads directory using user-controlled filename; validate type and path.",
+					Severity: config.SeverityHIGH,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-352: CSRF (very heuristic) ---
+			// Any handler using PostFormValue but no obvious CSRF check nearby.
+			if strings.Contains(trim, "PostFormValue(") &&
+				!strings.Contains(strings.ToLower(trim), "csrf") {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.csrf.missing-token",
+					CWE:      "CWE-352",
+					Message:  "POST handler uses form data but no CSRF token is referenced; possible CSRF risk.",
+					Severity: config.SeverityHIGH,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-400: Uncontrolled resource consumption (simple loop heuristic) ---
+			if strings.Contains(trim, "for i := 0; i < num; i++") {
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.dos.unbounded-loop",
+					CWE:      "CWE-400",
+					Message:  "Loop bound is controlled by user input without upper limit; possible DoS risk.",
+					Severity: config.SeverityMEDIUM,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-798: Hardcoded secrets (extra safety, in case Gitleaks misses) ---
+			if strings.Contains(trim, `"AKIA`) ||
+				strings.Contains(trim, `ghp_`) ||
+				strings.Contains(trim, `sk_live_`) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.hardcoded-secret.literal",
+					CWE:      "CWE-798",
+					Message:  "Possible hardcoded secret (looks like AWS key, GitHub token, or Stripe key).",
+					Severity: config.SeverityCRITICAL,
+					Snippet:  trim,
+				})
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("⚠️  GenSecPatterns walker error: %v\n", err)
+	}
+
+	fmt.Printf("  ✅ GenSecPatterns: %d findings\n", len(findings))
 	return findings, nil
 }
 
