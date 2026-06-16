@@ -67,12 +67,13 @@ bash
 gensec scan-and-fix [path]
 Runs the entire workflow: scan → fix → PR creation in one command.
 
-### heck Status
+### check Status
 bash
 gensec status
 Displays current scan status and pending findings.
 
 🔄 Workflow
+```
 Code
 ┌─────────────┐
 │   PHASE 1   │ Multi-Scanner Detection
@@ -109,6 +110,7 @@ Code
 ┌──────▼──────┐
 │   PHASE 5   │ GitHub PR Creation
 └─────────────┘
+```
 📁 Project Structure
 Code
 gensec/
