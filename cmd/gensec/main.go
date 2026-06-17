@@ -48,9 +48,13 @@ func cmdScan() {
 	fmt.Println("=" + strings.Repeat("=", 59))
 	fmt.Printf("Plan: %s\n", config.UserPlan)
 
-	// Validate credentials
-	if config.GroqAPIKey == "" {
-		fmt.Println("❌ Missing GROQ_API_KEY")
+	// Validate credentials — re-read from env so .env loaded by godotenv is respected
+	groqKey := os.Getenv("GROQ_API_KEY")
+	if groqKey == "" {
+		groqKey = config.GroqAPIKey // fallback to package-level var (set at init)
+	}
+	if groqKey == "" {
+		fmt.Println("Missing GROQ_API_KEY")
 		return
 	}
 
@@ -71,7 +75,7 @@ func cmdScan() {
 	fmt.Printf("📁 Loaded %d files\n", len(fileContent))
 
 	// Phase 1: Multi-Scanner
-	multiScanner := scanner.NewMultiScanner(config.UserPlan)
+	multiScanner := scanner.NewMultiScanner(config.UserPlan, scanRoot)
 	findings, err := multiScanner.ScanAll()
 	if err != nil {
 		fmt.Printf("❌ Scanning failed: %v\n", err)

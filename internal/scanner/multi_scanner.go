@@ -14,11 +14,12 @@ import (
 )
 
 type MultiScanner struct {
-	plan string
+	plan     string
+	scanRoot string
 }
 
-func NewMultiScanner(plan string) *MultiScanner {
-	return &MultiScanner{plan: plan}
+func NewMultiScanner(plan string, scanRoot string) *MultiScanner {
+	return &MultiScanner{plan: plan, scanRoot: scanRoot}
 }
 
 func (m *MultiScanner) ScanAll() ([]Finding, error) {
@@ -35,7 +36,6 @@ func (m *MultiScanner) ScanAll() ([]Finding, error) {
 		fn   func() ([]Finding, error)
 	}{
 		{"Semgrep", m.runSemgrep},
-		{"Gitleaks", m.runGitleaks},
 		{"Gitleaks", m.runGitleaks},
 		{"Trivy", m.runTrivy},
 		{"GenSecPatterns", m.runGenSecPatterns},
@@ -243,8 +243,13 @@ func (m *MultiScanner) runTrivy() ([]Finding, error) {
 func (m *MultiScanner) runGenSecPatterns() ([]Finding, error) {
 	findings := []Finding{}
 
-	// Walk all .go files in the current directory
-	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+	walkRoot := m.scanRoot
+	if walkRoot == "" {
+		walkRoot = "."
+	}
+
+	// Walk all .go files in the scan root
+	err := filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // skip on error, don't kill the whole scan
 		}
@@ -271,6 +276,61 @@ func (m *MultiScanner) runGenSecPatterns() ([]Finding, error) {
 			lineNo := i + 1
 			trim := strings.TrimSpace(line)
 
+			// --- CWE-89: SQL Injection (string concatenation in queries) ---
+			if (strings.Contains(trim, `"SELECT`) || strings.Contains(trim, `"INSERT`) ||
+				strings.Contains(trim, `"UPDATE`) || strings.Contains(trim, `"DELETE`)) &&
+				(strings.Contains(trim, `" + `) || strings.Contains(trim, `+"`) ||
+					strings.Contains(trim, `+ "`) || strings.Contains(trim, `+userInput`) ||
+					strings.Contains(trim, `+ userInput`)) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.sqli.string-concat",
+					CWE:      "CWE-89",
+					Message:  "SQL query built by string concatenation with user input; possible SQL injection.",
+					Severity: config.SeverityCRITICAL,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-89: SQL Injection via fmt.Sprintf ---
+			if strings.Contains(trim, "fmt.Sprintf(") &&
+				(strings.Contains(trim, "SELECT") || strings.Contains(trim, "INSERT") ||
+					strings.Contains(trim, "UPDATE") || strings.Contains(trim, "DELETE")) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.sqli.sprintf",
+					CWE:      "CWE-89",
+					Message:  "SQL query built using fmt.Sprintf with user data; use parameterized queries instead.",
+					Severity: config.SeverityCRITICAL,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-89: Unparameterized db.Query/db.Exec call ---
+			// Heuristic: db.Query(query) where `query` is a local var (no second arg on same line)
+			if (strings.HasPrefix(trim, "db.Query(query)") ||
+				strings.HasPrefix(trim, "rows, err := db.Query(query)") ||
+				trim == "db.Query(query)" || strings.Contains(trim, "db.Query(query)")) &&
+				!strings.Contains(trim, "db.Query(query,") {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.sqli.unparameterized-query",
+					CWE:      "CWE-89",
+					Message:  "db.Query called with a raw (possibly interpolated) query string; use parameterized queries.",
+					Severity: config.SeverityHIGH,
+					Snippet:  trim,
+				})
+			}
+
 			// --- CWE-78: Command Injection (exec.Command with shell) ---
 			if strings.Contains(trim, `exec.Command("sh", "-c"`) ||
 				strings.Contains(trim, `exec.Command("bash", "-c"`) {
@@ -287,8 +347,25 @@ func (m *MultiScanner) runGenSecPatterns() ([]Finding, error) {
 				})
 			}
 
-			// --- CWE-22: Path Traversal / Insecure file read ---
-			if strings.Contains(trim, `os.ReadFile("/var/www/files/`) ||
+			// --- CWE-22: Path Traversal — user-controlled path joined without clean check ---
+			if (strings.Contains(trim, `"/uploads/"`) || strings.Contains(trim, `"/var/www/files/"`)) &&
+				(strings.Contains(trim, " + ") || strings.Contains(trim, `filepath.Join`)) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.path-traversal.user-path",
+					CWE:      "CWE-22",
+					Message:  "User-controlled value joined to a base path without sanitization; possible path traversal.",
+					Severity: config.SeverityHIGH,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-22: ioutil.ReadFile / os.ReadFile with user-derived path ---
+			if strings.Contains(trim, `ioutil.ReadFile(filePath)`) ||
+				strings.Contains(trim, `os.ReadFile("/var/www/files/`) ||
 				strings.Contains(trim, `os.ReadFile("/uploads/`) {
 
 				findings = append(findings, Finding{
@@ -297,7 +374,7 @@ func (m *MultiScanner) runGenSecPatterns() ([]Finding, error) {
 					Line:     lineNo,
 					VulnID:   "gensec.path-traversal.file-read",
 					CWE:      "CWE-22",
-					Message:  "User-controlled file path used in os.ReadFile without sanitization; possible path traversal.",
+					Message:  "User-controlled file path used in ReadFile without sanitization; possible path traversal.",
 					Severity: config.SeverityHIGH,
 					Snippet:  trim,
 				})
@@ -364,10 +441,12 @@ func (m *MultiScanner) runGenSecPatterns() ([]Finding, error) {
 				})
 			}
 
-			// --- CWE-798: Hardcoded secrets (extra safety, in case Gitleaks misses) ---
+			// --- CWE-798: Hardcoded secrets ---
 			if strings.Contains(trim, `"AKIA`) ||
 				strings.Contains(trim, `ghp_`) ||
-				strings.Contains(trim, `sk_live_`) {
+				strings.Contains(trim, `sk_live_`) ||
+				strings.Contains(trim, `sk-`) ||
+				strings.Contains(trim, `"hooks.slack.com`) {
 
 				findings = append(findings, Finding{
 					Tool:     "gensec-patterns",
@@ -375,8 +454,26 @@ func (m *MultiScanner) runGenSecPatterns() ([]Finding, error) {
 					Line:     lineNo,
 					VulnID:   "gensec.hardcoded-secret.literal",
 					CWE:      "CWE-798",
-					Message:  "Possible hardcoded secret (looks like AWS key, GitHub token, or Stripe key).",
+					Message:  "Possible hardcoded secret (AWS key, GitHub token, Stripe key, or Slack webhook).",
 					Severity: config.SeverityCRITICAL,
+					Snippet:  trim,
+				})
+			}
+
+			// --- CWE-117: Sensitive data logged (connection strings, passwords) ---
+			if (strings.Contains(trim, "fmt.Println(") || strings.Contains(trim, "log.Print")) &&
+				(strings.Contains(strings.ToLower(trim), "password") ||
+					strings.Contains(strings.ToLower(trim), "connectionstring") ||
+					strings.Contains(strings.ToLower(trim), "secret")) {
+
+				findings = append(findings, Finding{
+					Tool:     "gensec-patterns",
+					File:     path,
+					Line:     lineNo,
+					VulnID:   "gensec.logging.sensitive-data",
+					CWE:      "CWE-117",
+					Message:  "Sensitive data (password/secret/connection string) may be logged to stdout.",
+					Severity: config.SeverityMEDIUM,
 					Snippet:  trim,
 				})
 			}

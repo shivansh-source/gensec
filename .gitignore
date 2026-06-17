@@ -1,0 +1,21 @@
+# Build artifacts (root-level compiled binaries only)
+/gensec
+/gensec.exe
+
+# GenSec scan reports (auto-generated, not for PR)
+report_flagged.json
+report_semgrep.json
+report_gitleaks.json
+report_trivy.json
+attempt_log.json
+gensec_pr_body.md
+
+# Backup files created during fix
+*.gensec.bak
+
+# Go
+*.test
+/vendor/
+
+# Env / secrets
+.env
