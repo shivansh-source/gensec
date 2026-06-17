@@ -6,13 +6,12 @@ import (
 	"log"
 )
 
-// VulnerableQueryBuilder - VULNERABLE: SQL Injection
+// VulnerableQueryBuilder - FIXED: SQL Injection
 func VulnerableQueryBuilder(db *sql.DB, userInput string) error {
-	// SECURITY ISSUE: Direct string concatenation in SQL query
-	query := "SELECT * FROM users WHERE username = '" + userInput + "'"
-	fmt.Println(query)
+	// SECURITY FIX: Using parameterized query
+	query := "SELECT * FROM users WHERE username = ?"
 	
-	rows, err := db.Query(query)
+	rows, err := db.Query(query, userInput)
 	if err != nil {
 		return err
 	}
@@ -35,12 +34,12 @@ func SecureQueryBuilder(db *sql.DB, userInput string) error {
 	return nil
 }
 
-// DynamicSQLVulnerable - Another vulnerable pattern
+// DynamicSQLVulnerable - FIXED: Using parameterized query
 func DynamicSQLVulnerable(db *sql.DB, searchTerm string) {
-	// VULNERABILITY: String formatting in SQL
-	query := fmt.Sprintf("SELECT * FROM products WHERE name LIKE '%%%s%%'", searchTerm)
+	// FIXED: Using parameterized query with LIKE
+	query := "SELECT * FROM products WHERE name LIKE CONCAT('%', ?, '%')"
 	
-	rows, err := db.Query(query)
+	rows, err := db.Query(query, searchTerm)
 	if err != nil {
 		log.Fatal(err)
 	}

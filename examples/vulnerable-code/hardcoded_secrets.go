@@ -1,54 +1,84 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"net/http"
+	"os"
+
+	_ "github.com/lib/pq"
+	"golang.org/x/crypto/hmac"
 )
 
-// VULNERABLE: Hardcoded API Keys
 const (
-	// SECURITY ISSUE: Hardcoded credentials
-	apiKey = "sk-1234567890abcdefghijk"
-	dbPassword = "admin@123456"
-	jwtSecret = "supersecretjwtkey12345"
+	apiKeyEnv = "API_KEY"
+	dbPasswordEnv = "DB_PASSWORD"
+	jwtSecretEnv = "JWT_SECRET"
+	awsAccessKeyEnv = "AWS_ACCESS_KEY"
+	awsSecretKeyEnv = "AWS_SECRET_KEY"
+	slackWebhookEnv = "SLACK_WEBHOOK"
 )
 
-// GetAPIKey - Exposes hardcoded API key
+var (
+	apiKey       = os.Getenv(apiKeyEnv)
+	dbPassword   = os.Getenv(dbPasswordEnv)
+	jwtSecret    = []byte(os.Getenv(jwtSecretEnv))
+	awsAccessKey = os.Getenv(awsAccessKeyEnv)
+	awsSecretKey = os.Getenv(awsSecretKeyEnv)
+	slackWebhook = os.Getenv(slackWebhookEnv)
+)
+
 func GetAPIKey() string {
 	return apiKey
 }
 
-// ConnectDatabase - Uses hardcoded password
 func ConnectDatabase() error {
-	connectionString := fmt.Sprintf("postgres://admin:%s@localhost:5432/mydb", dbPassword)
-	fmt.Println("Connecting to:", connectionString) // LOGS SENSITIVE DATA!
+	db, err := sql.Open("postgres", fmt.Sprintf("postgres://admin:%s@localhost:5432/mydb", dbPassword))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
 	return nil
 }
 
-// ValidateToken - Using hardcoded JWT secret
 func ValidateToken(token string) bool {
-	// VULNERABILITY: Hardcoded secret used for token validation
-	return token == jwtSecret
+ expectedMAC := hmac.New(sha256.New, jwtSecret)
+ expectedMAC.Write([]byte(token))
+ expectedMACBytes := expectedMAC.Sum(nil)
+ return subtle.ConstantTimeCompare([]byte(token), expectedMACBytes) == 1
 }
 
-// InitializeConfig - Multiple hardcoded secrets
 func InitializeConfig() map[string]string {
 	config := map[string]string{
-		"aws_access_key": "AKIAIOSFODNN7EXAMPLE",
-		"aws_secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-		"slack_webhook": "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXX",
+		"aws_access_key": awsAccessKey,
+		"aws_secret_key": awsSecretKey,
+		"slack_webhook": slackWebhook,
 	}
 	return config
 }
 
-// FIXED: Using environment variables
-func GetAPIKeySecure() string {
-	// Should use: os.Getenv("API_KEY")
-	return "" // Will be loaded from environment
-}
-
-func ConnectDatabaseSecure() error {
-	// Should use: os.Getenv("DB_PASSWORD")
-	connectionString := "postgres://admin:ENCRYPTED_PASSWORD@localhost:5432/mydb"
-	fmt.Println("Connecting to database...")
-	return nil
+func main() {
+	if apiKey == "" || dbPassword == "" || string(jwtSecret) == "" || awsAccessKey == "" || awsSecretKey == "" || slackWebhook == "" {
+		log.Fatal("One or more environment variables are not set")
+	}
+	fmt.Println("API Key:", GetAPIKey())
+	if err := ConnectDatabase(); err != nil {
+		log.Fatal(err)
+	}
+	if !ValidateToken("exampletoken") {
+		log.Fatal("Invalid token")
+	}
+	config := InitializeConfig()
+	jsonConfig, err := json.Marshal(config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(jsonConfig))
 }
