@@ -106,6 +106,7 @@
   <input type="text" id="pathInput" placeholder="Path to scan (e.g. . or /path/to/repo)" value=".">
   <button type="submit" id="scanBtn">Scan</button>
 </form>
+<div id="demoNote" class="subtitle" style="max-width:960px;margin:-1rem auto 1.5rem;display:none;"></div>
 
 <div id="output"></div>
 
@@ -113,10 +114,24 @@
 const form = document.getElementById('scanForm');
 const btn = document.getElementById('scanBtn');
 const output = document.getElementById('output');
+const pathInput = document.getElementById('pathInput');
+const demoNote = document.getElementById('demoNote');
+
+// In demo mode the server ignores whatever path is sent and always scans
+// its own fixed target - the input is disabled so that's not surprising.
+fetch('/api/config').then(r => r.json()).then(cfg => {
+  if (cfg.demoMode) {
+    pathInput.disabled = true;
+    pathInput.value = '(fixed demo target)';
+    btn.textContent = 'Run Demo Scan';
+    demoNote.style.display = 'block';
+    demoNote.textContent = 'Demo mode: this instance always scans a fixed bundled repo, regardless of input.';
+  }
+}).catch(() => {});
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const path = document.getElementById('pathInput').value.trim() || '.';
+  const path = pathInput.disabled ? '' : (pathInput.value.trim() || '.');
 
   btn.disabled = true;
   btn.textContent = 'Scanning…';

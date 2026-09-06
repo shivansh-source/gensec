@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/shivansh-source/gensec/internal/config"
 	"github.com/shivansh-source/gensec/internal/flagging"
@@ -16,6 +18,23 @@ import (
 
 //go:embed static/index.html
 var webFS embed.FS
+
+// GENSEC_WEB_FIXED_PATH locks the dashboard to scanning one fixed,
+// server-chosen path regardless of what a client requests - this is what
+// makes it safe to expose beyond localhost. Without it, /api/scan takes a
+// filesystem path straight from client input, which is fine on your own
+// machine but lets anyone hitting a public instance read arbitrary paths
+// on whatever host it runs on.
+const fixedPathEnvVar = "GENSEC_WEB_FIXED_PATH"
+
+// scanCooldown serializes scans and caps how often the (real, metered) LLM
+// API gets called - one scan at a time, at most once per cooldown window.
+const scanCooldown = 5 * time.Second
+
+var (
+	scanMu       sync.Mutex
+	lastScanTime time.Time
+)
 
 // scanResponse is what GET /api/scan returns to the dashboard.
 type scanResponse struct {
@@ -43,10 +62,14 @@ func cmdWeb() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveIndex)
 	mux.HandleFunc("/api/scan", handleScanAPI)
+	mux.HandleFunc("/api/config", handleConfigAPI)
 
 	addr := ":" + port
 	fmt.Printf("\n🌐 GenSec web dashboard: http://localhost:%s\n", port)
 	fmt.Println("   (read-only: scans and shows findings, never fixes or opens a PR)")
+	if fixed := os.Getenv(fixedPathEnvVar); fixed != "" {
+		fmt.Printf("   demo mode: locked to scanning %q regardless of client input\n", fixed)
+	}
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("web server error: %v", err)
 	}
@@ -66,11 +89,33 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+func handleConfigAPI(w http.ResponseWriter, r *http.Request) {
+	fixed := os.Getenv(fixedPathEnvVar)
+	writeJSON(w, map[string]interface{}{
+		"demoMode":  fixed != "",
+		"fixedPath": fixed,
+	})
+}
+
 func handleScanAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	scanMu.Lock()
+	defer scanMu.Unlock()
+	if since := time.Since(lastScanTime); since < scanCooldown {
+		wait := scanCooldown - since
+		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", wait.Seconds()))
+		http.Error(w, fmt.Sprintf("please wait %.0fs between scans", wait.Seconds()), http.StatusTooManyRequests)
+		return
+	}
+	// Recorded on the way out (see defer below), not here: a real scan
+	// takes several seconds itself, so starting the cooldown clock now
+	// would let it fully elapse *during* this very request, making the
+	// limit a no-op against back-to-back requests.
+	defer func() { lastScanTime = time.Now() }()
 
 	var req struct {
 		Path string `json:"path"`
@@ -79,8 +124,12 @@ func handleScanAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
+
 	scanRoot := req.Path
-	if scanRoot == "" {
+	if fixed := os.Getenv(fixedPathEnvVar); fixed != "" {
+		// Demo mode: the client's requested path is ignored entirely.
+		scanRoot = fixed
+	} else if scanRoot == "" {
 		scanRoot = "."
 	}
 
