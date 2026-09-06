@@ -47,6 +47,11 @@ RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/
 COPY --from=builder /build/gensec /usr/local/bin/gensec
 RUN chmod +x /usr/local/bin/gensec
 
+# Bundled demo target for `gensec web` with GENSEC_WEB_FIXED_PATH set to
+# /app/demo (used for public/hosted demo deployments) - not needed for
+# `scan`/`fix`/`pr`, which operate on whatever you mount at /scan instead.
+COPY examples/vulnerable-code/ /app/demo/
+
 WORKDIR /scan
 
 ENV USER_PLAN="pro"

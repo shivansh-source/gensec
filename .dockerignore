@@ -3,6 +3,7 @@
 .env
 *.log
 report_*.json
+**/report_*.json
 attempt_log.json
 gensec_pr_body.md
 vendor
@@ -11,7 +12,6 @@ node_modules
 gensec
 gensec.exe
 *.exe
-examples/
 docs/
 *.md
 deploy/
