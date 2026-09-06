@@ -54,7 +54,13 @@ type scanResponse struct {
 // Not hardened for exposure beyond localhost/a trusted network: there's no
 // auth, and the scanned path comes straight from client input.
 func cmdWeb() {
+	// Precedence: explicit CLI arg > $PORT (how most hosting platforms -
+	// Render, Railway, Cloud Run, etc. - tell a container what to listen
+	// on) > 8080.
 	port := "8080"
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		port = envPort
+	}
 	if len(os.Args) >= 3 && os.Args[2] != "" {
 		port = os.Args[2]
 	}
