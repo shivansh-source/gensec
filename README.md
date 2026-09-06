@@ -255,3 +255,7 @@ Groq and GitHub API calls — no real network access or API keys are needed
 to run them. See the comments in `internal/github/client_test.go` for what
 isn't covered and why (the PR-creation path shells out to real `git`
 commands with no injectable seam for testing it end-to-end).
+
+## License
+
+[MIT](LICENSE)
